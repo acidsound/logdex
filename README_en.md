@@ -1,4 +1,11 @@
-# Codex Thread Export
+# Conversation Exporters
+
+This repository contains two exporters.
+
+- `export_codex_threads.py`: exports local Codex threads
+- `export_antigravity_conversations.py`: exports local Antigravity / Gemini CLI workspace data
+
+## Codex
 
 `export_codex_threads.py` reads the local Codex state database under `~/.codex`, resolves each thread's `rollout_path`, and writes one Markdown file per thread.
 
@@ -71,3 +78,76 @@ All options:
 | `--include-tool-output` | flag | off | Includes raw tool output bodies in the Markdown export. |
 | `--max-tool-output-chars` | number | `4000` | Maximum number of characters kept for each tool output block. |
 | `--no-incremental` | flag | off | Ignores `.codex-export-state.json` and forces a full rebuild. |
+
+## Antigravity
+
+`export_antigravity_conversations.py` reads the Gemini-compatible local store used by Antigravity and exports workspace-affiliated conversations, artifact bundles, and code tracker snapshots as readable Markdown.
+
+The implementation is aligned with the storage layout used by [`google-gemini/gemini-cli`](https://github.com/google-gemini/gemini-cli). It combines these sources by default:
+
+- `~/.gemini/tmp/<workspace>/chats/session-*.json`: conversation body
+- `~/.gemini/tmp/<workspace>/logs.json`: slash commands and log-only user inputs
+- `~/.gemini/projects.json`, `.project_root`: mapping between workspace slug, legacy hash, and actual workspace root
+- `~/.gemini/antigravity/brain/<bundle-id>`: walkthroughs, task files, plans, and other artifact markdown/json
+- `~/.gemini/antigravity/annotations/<bundle-id>.pbtxt`: artifact annotations
+- `~/.gemini/antigravity/browser_recordings/<bundle-id>`: browser recording metadata and related file inventory
+- `~/.gemini/antigravity/code_tracker/active/<workspace>_<hash>`: code tracker snapshots
+- a running Antigravity language server when available: real cascade trajectory step transcripts
+
+The export is grouped by workspace:
+
+- root `index.md`: workspace list
+- `workspaces/<workspace>/index.md`: conversation / artifact / code tracker list for that workspace
+- `workspaces/<workspace>/conversations/*.md`: per-conversation Markdown
+  - live RPC transcript first when the Antigravity app is running, including real `USER_INPUT` and assistant steps
+  - transcript-backed when a raw chat conversation exists
+  - artifact-backed when only `brain/<bundle-id>` summaries are available
+- `workspaces/<workspace>/artifacts/<bundle>/index.md`: artifact bundle summary
+- `workspaces/<workspace>/artifacts/<bundle>/files/*.md`: rendered text artifact files
+- `workspaces/<workspace>/artifacts/<bundle>/media.md`: inventory for non-text files such as browser recordings
+- `workspaces/<workspace>/code_tracker/<snapshot>/index.md`: code tracker snapshot summary
+- `workspaces/<workspace>/code_tracker/<snapshot>/files/*.md`: rendered code tracker files
+
+Repeated runs against the same `--output-dir` are incremental by default. The exporter stores `.antigravity-export-state.json` in that directory and only reprocesses changed pages. If the same conversation exists in both a legacy hash directory and a newer slug directory, it deduplicates by conversation ID. It also cleans up stale files left behind by older export layouts.
+
+Basic usage:
+
+```sh
+python3 export_antigravity_conversations.py --output-dir antigravity-export
+```
+
+For the most exhaustive workspace-level export, this is the recommended command:
+
+```sh
+python3 export_antigravity_conversations.py \
+  --output-dir antigravity-export \
+  --include-system-only \
+  --include-subagents
+```
+
+This includes regular conversations plus system-only conversations and conversations whose `kind` is `subagent`.
+If the Antigravity app is running, the exporter first tries to pull real trajectory transcripts from the live language server RPC. It falls back to bundle-metadata reconstruction only when a live transcript is unavailable.
+
+Useful options:
+
+```sh
+python3 export_antigravity_conversations.py --workspace-id nanoclaw
+python3 export_antigravity_conversations.py --session-id cdc4c134-5bb8-4e52-a22f-200a5c6881e5
+python3 export_antigravity_conversations.py --include-system-only
+python3 export_antigravity_conversations.py --workspace-id acidapps --output-dir antigravity-acidapps
+python3 export_antigravity_conversations.py --output-dir antigravity-export-20260311 --no-incremental
+```
+
+All options:
+
+| Option | Argument | Default | Description |
+| --- | --- | --- | --- |
+| `--gemini-home` | path | `~/.gemini` | Sets the shared Gemini / Antigravity home directory. |
+| `--output-dir` | path | `antigravity-export` | Output directory for the export. |
+| `--session-id` | conversation ID | none | Exports only the specified conversation. You can pass it multiple times. It does not filter artifact or code tracker exports. |
+| `--workspace-id` | workspace ID | none | Exports data only for the specified workspace slug, code-tracker prefix, legacy hash, or original mixed-case identifier. You can pass it multiple times. |
+| `--limit` | number | none | Limits how many conversations are processed, ordered by most recent first. |
+| `--include-system-only` | flag | off | Includes conversations that only contain info / warning / error messages. |
+| `--include-subagents` | flag | off | Includes conversations whose `kind` is `subagent`. |
+| `--max-tool-output-chars` | number | `4000` | Maximum number of characters kept for each tool result block. |
+| `--no-incremental` | flag | off | Ignores `.antigravity-export-state.json` and forces a full rebuild. |
