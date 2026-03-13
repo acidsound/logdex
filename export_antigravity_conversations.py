@@ -8,11 +8,14 @@ import json
 import mimetypes
 import os
 import pathlib
+import platform
 import re
+import select
 import subprocess
 import textwrap
 import unicodedata
 import urllib.parse
+import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any
@@ -171,6 +174,7 @@ class LiveConversationRecord:
     workspace: WorkspaceInfo
     summary: dict[str, Any]
     trajectory: dict[str, Any]
+    source_kind: str
     source_pid: int
     source_port: int
 
@@ -361,6 +365,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_TOOL_OUTPUT_CHARS,
         help="Maximum number of characters to keep for each tool output block.",
+    )
+    parser.add_argument(
+        "--no-standalone-ls",
+        action="store_true",
+        help="Do not spawn the bundled Antigravity standalone language server when no live app server is available.",
     )
     parser.add_argument(
         "--no-incremental",
@@ -637,11 +646,112 @@ def discover_base_workspaces(gemini_home: pathlib.Path, catalog: WorkspaceCatalo
 
 
 def antigravity_app_cert_path() -> pathlib.Path | None:
-    candidate = pathlib.Path(
-        "/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/dist/languageServer/cert.pem"
-    )
+    override = os.environ.get("ANTIGRAVITY_LANGUAGE_SERVER_CERT_PATH")
+    if override:
+        candidate = pathlib.Path(override).expanduser()
+        if candidate.exists():
+            return candidate
+    app_root = antigravity_app_root_path()
+    if app_root is None:
+        return None
+    candidate = app_root / "extensions" / "antigravity" / "dist" / "languageServer" / "cert.pem"
     if candidate.exists():
         return candidate
+    return None
+
+
+def antigravity_app_root_candidates() -> list[pathlib.Path]:
+    seen: set[str] = set()
+    candidates: list[pathlib.Path] = []
+
+    def add(path: str | pathlib.Path | None) -> None:
+        if not path:
+            return
+        candidate = pathlib.Path(path).expanduser()
+        key = str(candidate)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(candidate)
+
+    add(os.environ.get("ANTIGRAVITY_EDITOR_APP_ROOT"))
+    add(os.environ.get("ANTIGRAVITY_APP_ROOT"))
+
+    system = platform.system()
+    home = pathlib.Path.home()
+    if system == "Darwin":
+        add("/Applications/Antigravity.app/Contents/Resources/app")
+        add(home / "Applications" / "Antigravity.app" / "Contents" / "Resources" / "app")
+    elif system == "Linux":
+        add("/opt/Antigravity/resources/app")
+        add("/opt/antigravity/resources/app")
+        add("/usr/lib/Antigravity/resources/app")
+        add("/usr/lib/antigravity/resources/app")
+        add("/usr/share/antigravity/resources/app")
+        add(home / ".local" / "share" / "Antigravity" / "resources" / "app")
+        add(home / ".local" / "share" / "antigravity" / "resources" / "app")
+    elif system == "Windows":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        program_files = os.environ.get("ProgramFiles")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)")
+        add(pathlib.Path(local_appdata) / "Programs" / "Antigravity" / "resources" / "app" if local_appdata else None)
+        add(pathlib.Path(local_appdata) / "Antigravity" / "resources" / "app" if local_appdata else None)
+        add(pathlib.Path(program_files) / "Antigravity" / "resources" / "app" if program_files else None)
+        add(pathlib.Path(program_files_x86) / "Antigravity" / "resources" / "app" if program_files_x86 else None)
+    return candidates
+
+
+def antigravity_app_root_path() -> pathlib.Path | None:
+    for candidate in antigravity_app_root_candidates():
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def antigravity_language_server_binary_path() -> pathlib.Path | None:
+    override = os.environ.get("ANTIGRAVITY_LANGUAGE_SERVER_PATH")
+    if override:
+        candidate = pathlib.Path(override).expanduser()
+        if candidate.exists():
+            return candidate
+
+    app_root = antigravity_app_root_path()
+    if app_root is None:
+        return None
+    bin_dir = app_root / "extensions" / "antigravity" / "bin"
+    if not bin_dir.exists():
+        return None
+
+    machine = platform.machine().lower()
+    system = platform.system()
+    preferred_names: list[str] = []
+    if system == "Darwin":
+        if machine in {"arm64", "aarch64"}:
+            preferred_names.extend(["language_server_macos_arm", "language_server_darwin_arm64"])
+        preferred_names.extend(["language_server_macos", "language_server_darwin", "language_server"])
+    elif system == "Linux":
+        if machine in {"arm64", "aarch64"}:
+            preferred_names.extend(["language_server_linux_arm64", "language_server_linux_arm"])
+        elif machine in {"x86_64", "amd64"}:
+            preferred_names.extend(["language_server_linux_x64", "language_server_linux_amd64"])
+        preferred_names.extend(["language_server_linux", "language_server"])
+    elif system == "Windows":
+        if machine in {"arm64", "aarch64"}:
+            preferred_names.extend(["language_server_windows_arm64.exe"])
+        elif machine in {"x86_64", "amd64"}:
+            preferred_names.extend(["language_server_windows_x64.exe", "language_server_windows_amd64.exe"])
+        preferred_names.extend(["language_server_windows.exe", "language_server.exe"])
+
+    for name in preferred_names:
+        candidate = bin_dir / name
+        if candidate.exists():
+            return candidate
+
+    for candidate in sorted(bin_dir.iterdir()):
+        if not candidate.is_file():
+            continue
+        if candidate.name.startswith("language_server"):
+            return candidate
     return None
 
 
@@ -652,6 +762,14 @@ def parse_file_uri(uri: str) -> str | None:
         parsed = urllib.parse.urlparse(uri)
         return urllib.parse.unquote(parsed.path) or None
     return uri
+
+
+@dataclass
+class LiveLanguageServerEndpoint:
+    source_kind: str
+    pid: int
+    port: int
+    csrf_token: str
 
 
 def run_json_command(command: list[str]) -> str:
@@ -706,7 +824,9 @@ def parse_language_server_processes() -> list[tuple[int, str]]:
     processes: list[tuple[int, str]] = []
     for raw_line in output.splitlines():
         line = raw_line.strip()
-        if not line or "language_server_macos_arm" not in line or "--enable_lsp" not in line:
+        if not line or "--enable_lsp" not in line:
+            continue
+        if re.search(r"(^|[/\\])language_server[^/\s\\\\]*(?:\.exe)?(\s|$)", line) is None:
             continue
         match = re.match(r"^(?P<pid>\d+)\s+(?P<command>.+)$", line)
         if not match:
@@ -739,8 +859,8 @@ def extract_flag(command: str, flag: str) -> str | None:
     return match.group(1)
 
 
-def discover_live_language_servers(cert_path: pathlib.Path) -> list[tuple[int, int, str]]:
-    endpoints: list[tuple[int, int, str]] = []
+def discover_live_language_servers(cert_path: pathlib.Path) -> list[LiveLanguageServerEndpoint]:
+    endpoints: list[LiveLanguageServerEndpoint] = []
     for pid, command in parse_language_server_processes():
         csrf_token = extract_flag(command, "--csrf_token")
         if not csrf_token:
@@ -757,9 +877,113 @@ def discover_live_language_servers(cert_path: pathlib.Path) -> list[tuple[int, i
             except RuntimeError:
                 continue
             if "lastExtensionHeartbeat" in response:
-                endpoints.append((pid, port, csrf_token))
+                endpoints.append(
+                    LiveLanguageServerEndpoint(
+                        source_kind="app",
+                        pid=pid,
+                        port=port,
+                        csrf_token=csrf_token,
+                    )
+                )
                 break
     return endpoints
+
+
+def spawn_standalone_language_server(
+    cert_path: pathlib.Path,
+    gemini_home: pathlib.Path,
+) -> tuple[subprocess.Popen[str], LiveLanguageServerEndpoint] | None:
+    binary_path = antigravity_language_server_binary_path()
+    if binary_path is None:
+        return None
+    csrf_token = str(uuid.uuid4())
+    command = [
+        str(binary_path),
+        "--enable_lsp",
+        "--standalone",
+        "--random_port",
+        "--csrf_token",
+        csrf_token,
+        "--app_data_dir",
+        "antigravity",
+        "--gemini_dir",
+        str(gemini_home),
+        "--cloud_code_endpoint",
+        "https://daily-cloudcode-pa.googleapis.com",
+    ]
+    env = os.environ.copy()
+    app_root = antigravity_app_root_path()
+    if app_root is not None:
+        env.setdefault("ANTIGRAVITY_EDITOR_APP_ROOT", str(app_root))
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+
+    port: int | None = None
+    if process.stderr is not None:
+        deadline = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=15)
+        while dt.datetime.now(dt.timezone.utc) < deadline:
+            if process.poll() is not None:
+                break
+            ready, _, _ = select.select([process.stderr], [], [], 0.5)
+            if not ready:
+                continue
+            line = process.stderr.readline()
+            if not line:
+                continue
+            match = re.search(r"port at (\d+) for HTTPS", line)
+            if match:
+                port = int(match.group(1))
+                break
+
+    if port is None:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        return None
+
+    heartbeat_deadline = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=10)
+    while dt.datetime.now(dt.timezone.utc) < heartbeat_deadline:
+        try:
+            response = node_connect_rpc(
+                cert_path,
+                port=port,
+                csrf_token=csrf_token,
+                method="Heartbeat",
+                payload={"metadata": {}},
+            )
+        except RuntimeError:
+            if process.poll() is not None:
+                break
+            continue
+        if "lastExtensionHeartbeat" in response:
+            return (
+                process,
+                LiveLanguageServerEndpoint(
+                    source_kind="standalone",
+                    pid=process.pid,
+                    port=port,
+                    csrf_token=csrf_token,
+                ),
+            )
+
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+    return None
 
 
 def register_live_workspace(catalog: WorkspaceCatalog, summary: dict[str, Any]) -> WorkspaceInfo | None:
@@ -796,6 +1020,80 @@ def should_export_live_conversation(trajectory: dict[str, Any], args: argparse.N
     return False
 
 
+def fetch_live_conversations_from_endpoint(
+    args: argparse.Namespace,
+    catalog: WorkspaceCatalog,
+    cert_path: pathlib.Path,
+    endpoint: LiveLanguageServerEndpoint,
+) -> dict[str, LiveConversationRecord]:
+    requested_session_ids = set(args.session_ids)
+    requested_workspace_ids = set(args.workspace_ids)
+    conversations_by_id: dict[str, LiveConversationRecord] = {}
+    try:
+        summaries_response = node_connect_rpc(
+            cert_path,
+            port=endpoint.port,
+            csrf_token=endpoint.csrf_token,
+            method="GetAllCascadeTrajectories",
+            payload={},
+        )
+    except RuntimeError:
+        return {}
+    summaries = summaries_response.get("trajectorySummaries") or {}
+    if not isinstance(summaries, dict):
+        return {}
+
+    for cascade_id, summary in summaries.items():
+        if not isinstance(summary, dict):
+            continue
+        cascade_text = str(cascade_id).strip()
+        if not cascade_text:
+            continue
+        if requested_session_ids and cascade_text not in requested_session_ids:
+            continue
+        workspace = register_live_workspace(catalog, summary)
+        if workspace is None:
+            continue
+        if requested_workspace_ids and not requested_workspace_ids.intersection(workspace.aliases):
+            continue
+        try:
+            trajectory_response = node_connect_rpc(
+                cert_path,
+                port=endpoint.port,
+                csrf_token=endpoint.csrf_token,
+                method="GetCascadeTrajectory",
+                payload={"cascadeId": cascade_text},
+            )
+        except RuntimeError:
+            continue
+        trajectory = trajectory_response.get("trajectory") or {}
+        if not isinstance(trajectory, dict):
+            continue
+        if not should_export_live_conversation(trajectory, args):
+            continue
+        record = LiveConversationRecord(
+            conversation_id=cascade_text,
+            trajectory_id=str(trajectory.get("trajectoryId") or summary.get("trajectoryId") or cascade_text),
+            workspace=workspace,
+            summary=summary,
+            trajectory=trajectory,
+            source_kind=endpoint.source_kind,
+            source_pid=endpoint.pid,
+            source_port=endpoint.port,
+        )
+        existing = conversations_by_id.get(cascade_text)
+        if existing is None:
+            conversations_by_id[cascade_text] = record
+            continue
+        existing_updated = parse_iso_datetime(existing.summary.get("lastModifiedTime"))
+        candidate_updated = parse_iso_datetime(summary.get("lastModifiedTime"))
+        if (candidate_updated or dt.datetime.min.replace(tzinfo=dt.timezone.utc)) > (
+            existing_updated or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        ):
+            conversations_by_id[cascade_text] = record
+    return conversations_by_id
+
+
 def discover_live_conversations(
     args: argparse.Namespace,
     gemini_home: pathlib.Path,
@@ -807,74 +1105,47 @@ def discover_live_conversations(
     try:
         endpoints = discover_live_language_servers(cert_path)
     except (FileNotFoundError, RuntimeError):
-        return []
+        endpoints = []
 
-    requested_session_ids = set(args.session_ids)
-    requested_workspace_ids = set(args.workspace_ids)
     conversations_by_id: dict[str, LiveConversationRecord] = {}
-
-    for pid, port, csrf_token in endpoints[:1]:
-        try:
-            summaries_response = node_connect_rpc(
-                cert_path,
-                port=port,
-                csrf_token=csrf_token,
-                method="GetAllCascadeTrajectories",
-                payload={},
-            )
-        except RuntimeError:
-            continue
-        summaries = summaries_response.get("trajectorySummaries") or {}
-        if not isinstance(summaries, dict):
-            continue
-
-        for cascade_id, summary in summaries.items():
-            if not isinstance(summary, dict):
-                continue
-            cascade_text = str(cascade_id).strip()
-            if not cascade_text:
-                continue
-            if requested_session_ids and cascade_text not in requested_session_ids:
-                continue
-            workspace = register_live_workspace(catalog, summary)
-            if workspace is None:
-                continue
-            if requested_workspace_ids and not requested_workspace_ids.intersection(workspace.aliases):
-                continue
-            try:
-                trajectory_response = node_connect_rpc(
-                    cert_path,
-                    port=port,
-                    csrf_token=csrf_token,
-                    method="GetCascadeTrajectory",
-                    payload={"cascadeId": cascade_text},
-                )
-            except RuntimeError:
-                continue
-            trajectory = trajectory_response.get("trajectory") or {}
-            if not isinstance(trajectory, dict):
-                continue
-            if not should_export_live_conversation(trajectory, args):
-                continue
-            record = LiveConversationRecord(
-                conversation_id=cascade_text,
-                trajectory_id=str(trajectory.get("trajectoryId") or summary.get("trajectoryId") or cascade_text),
-                workspace=workspace,
-                summary=summary,
-                trajectory=trajectory,
-                source_pid=pid,
-                source_port=port,
-            )
-            existing = conversations_by_id.get(cascade_text)
+    for endpoint in endpoints:
+        for cascade_id, record in fetch_live_conversations_from_endpoint(
+            args,
+            catalog,
+            cert_path,
+            endpoint,
+        ).items():
+            existing = conversations_by_id.get(cascade_id)
             if existing is None:
-                conversations_by_id[cascade_text] = record
+                conversations_by_id[cascade_id] = record
                 continue
             existing_updated = parse_iso_datetime(existing.summary.get("lastModifiedTime"))
-            candidate_updated = parse_iso_datetime(summary.get("lastModifiedTime"))
+            candidate_updated = parse_iso_datetime(record.summary.get("lastModifiedTime"))
             if (candidate_updated or dt.datetime.min.replace(tzinfo=dt.timezone.utc)) > (
                 existing_updated or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
             ):
-                conversations_by_id[cascade_text] = record
+                conversations_by_id[cascade_id] = record
+
+    if not conversations_by_id and not args.no_standalone_ls:
+        spawned = spawn_standalone_language_server(cert_path, gemini_home)
+        if spawned is not None:
+            spawned_process, endpoint = spawned
+            try:
+                for cascade_id, record in fetch_live_conversations_from_endpoint(
+                    args,
+                    catalog,
+                    cert_path,
+                    endpoint,
+                ).items():
+                    conversations_by_id[cascade_id] = record
+            finally:
+                if spawned_process.poll() is None:
+                    spawned_process.terminate()
+                    try:
+                        spawned_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        spawned_process.kill()
+                        spawned_process.wait(timeout=5)
 
     conversations = sorted(
         conversations_by_id.values(),
@@ -2187,7 +2458,7 @@ def render_live_conversation_markdown(
         f"- Updated: `{format_iso_timestamp(conversation.summary.get('lastModifiedTime')) or '-'}`",
         f"- Status: `{conversation.summary.get('status') or '-'}`",
         f"- Step Count: `{conversation.summary.get('stepCount') or len(conversation.trajectory.get('steps') or [])}`",
-        f"- Live RPC Source: `pid={conversation.source_pid} port={conversation.source_port}`",
+        f"- Live RPC Source: `{conversation.source_kind} pid={conversation.source_pid} port={conversation.source_port}`",
     ]
     if conversation.workspace.root:
         metadata_lines.append(f"- Workspace Root: `{conversation.workspace.root}`")
@@ -2460,6 +2731,19 @@ def build_generated_pages(
             continue
         conversation_title = bundle_title(bundle)
         updated_prefix = (bundle_timestamp(bundle) or "unknown")[:10]
+        bundle_dir = workspaces_dir / bundle.workspace.slug / "artifacts" / bundle.bundle_id
+        bundle_index_path = bundle_dir / "index.md"
+        media_page_path = bundle_dir / "media.md"
+        text_links = [
+            (source_path.name, bundle_text_targets[(bundle.bundle_id, source_path)].relative_to(bundle_dir))
+            for source_path in bundle.text_files
+            if (bundle.bundle_id, source_path) in bundle_text_targets
+        ]
+        media_assets = [
+            (source_path, bundle_media_targets[(bundle.bundle_id, source_path)].relative_to(bundle_dir))
+            for source_path in bundle.media_files
+            if (bundle.bundle_id, source_path) in bundle_media_targets
+        ]
         conversation_path = (
             workspaces_dir
             / bundle.workspace.slug

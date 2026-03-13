@@ -92,7 +92,7 @@ The implementation is aligned with the storage layout used by [`google-gemini/ge
 - `~/.gemini/antigravity/annotations/<bundle-id>.pbtxt`: artifact annotations
 - `~/.gemini/antigravity/browser_recordings/<bundle-id>`: browser recording metadata and related file inventory
 - `~/.gemini/antigravity/code_tracker/active/<workspace>_<hash>`: code tracker snapshots
-- a running Antigravity language server when available: real cascade trajectory step transcripts
+- a running Antigravity language server, or a headless standalone language server started by the exporter when needed: real cascade trajectory step transcripts
 
 The export is grouped by workspace:
 
@@ -100,6 +100,7 @@ The export is grouped by workspace:
 - `workspaces/<workspace>/index.md`: conversation / artifact / code tracker list for that workspace
 - `workspaces/<workspace>/conversations/*.md`: per-conversation Markdown
   - live RPC transcript first when the Antigravity app is running, including real `USER_INPUT` and assistant steps
+  - if the app is closed, it can briefly start the bundled standalone language server and still try to recover the real transcript
   - transcript-backed when a raw chat conversation exists
   - artifact-backed when only `brain/<bundle-id>` summaries are available
 - `workspaces/<workspace>/artifacts/<bundle>/index.md`: artifact bundle summary
@@ -126,7 +127,8 @@ python3 export_antigravity_conversations.py \
 ```
 
 This includes regular conversations plus system-only conversations and conversations whose `kind` is `subagent`.
-If the Antigravity app is running, the exporter first tries to pull real trajectory transcripts from the live language server RPC. It falls back to bundle-metadata reconstruction only when a live transcript is unavailable.
+The exporter first tries a running Antigravity app language server. If none is available, it briefly starts the platform-appropriate bundled `language_server* --standalone` headlessly and attempts the same trajectory RPC extraction. It only falls back to raw chat or bundle-metadata reconstruction when both real-transcript paths are unavailable.
+The default discovery logic includes macOS, Linux, and Windows install-layout candidates, and you can override it with `ANTIGRAVITY_EDITOR_APP_ROOT`, `ANTIGRAVITY_LANGUAGE_SERVER_PATH`, or `ANTIGRAVITY_LANGUAGE_SERVER_CERT_PATH`.
 
 Useful options:
 
@@ -150,4 +152,5 @@ All options:
 | `--include-system-only` | flag | off | Includes conversations that only contain info / warning / error messages. |
 | `--include-subagents` | flag | off | Includes conversations whose `kind` is `subagent`. |
 | `--max-tool-output-chars` | number | `4000` | Maximum number of characters kept for each tool result block. |
+| `--no-standalone-ls` | flag | off | Disables automatic startup of the bundled standalone language server when no live app server is available. |
 | `--no-incremental` | flag | off | Ignores `.antigravity-export-state.json` and forces a full rebuild. |

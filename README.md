@@ -92,7 +92,7 @@ python3 export_codex_threads.py --output-dir codex-export-by-project-20260310 --
 - `~/.gemini/antigravity/annotations/<bundle-id>.pbtxt`: artifact annotation
 - `~/.gemini/antigravity/browser_recordings/<bundle-id>`: browser recording metadata 와 관련 파일 inventory
 - `~/.gemini/antigravity/code_tracker/active/<workspace>_<hash>`: code tracker snapshot
-- 실행 중인 Antigravity language server (가능할 때): 실제 cascade trajectory step transcript
+- 실행 중인 Antigravity language server, 또는 필요할 때 exporter 가 headless 로 띄운 standalone language server: 실제 cascade trajectory step transcript
 
 내보내기 결과는 workspace 기준으로 묶입니다.
 
@@ -100,6 +100,7 @@ python3 export_codex_threads.py --output-dir codex-export-by-project-20260310 --
 - `workspaces/<workspace>/index.md`: 해당 workspace 의 conversation / artifact / code tracker 목록
 - `workspaces/<workspace>/conversations/*.md`: conversation 별 Markdown 문서
   - Antigravity 앱이 실행 중이면 live RPC transcript 를 우선 사용해서 실제 `USER_INPUT` / assistant step 을 export
+  - 앱이 꺼져 있어도 bundled standalone language server 를 잠깐 띄워 real transcript 를 시도
   - raw chat store 에 conversation 이 있으면 transcript 기반으로 export
   - chat transcript 가 없더라도 `brain/<bundle-id>` artifact summary 를 기반으로 artifact-backed conversation 을 추가 생성
 - `workspaces/<workspace>/artifacts/<bundle>/index.md`: artifact bundle 요약
@@ -126,7 +127,8 @@ python3 export_antigravity_conversations.py \
 ```
 
 이 조합은 일반 conversation 외에 user/gemini 메시지가 없는 system-only conversation 과 `kind=subagent` conversation 까지 함께 포함합니다.
-또한 Antigravity 앱이 실행 중이면 exporter 는 live language server RPC 로 실제 trajectory transcript 를 먼저 가져오고, 앱이 꺼져 있거나 live transcript 를 얻지 못한 conversation 에 대해서만 bundle metadata 기반 artifact-backed conversation 으로 fallback 합니다.
+또한 exporter 는 먼저 실행 중인 Antigravity app language server 에 붙고, 그게 없으면 플랫폼에 맞는 bundled `language_server* --standalone` 를 headless 로 잠깐 띄워 실제 trajectory transcript 를 시도합니다. 두 경로 모두 실패한 conversation 에 대해서만 raw chat 또는 bundle metadata 기반 fallback 으로 내려갑니다.
+기본 후보 경로는 macOS / Linux / Windows 용으로 나뉘며, 필요하면 `ANTIGRAVITY_EDITOR_APP_ROOT`, `ANTIGRAVITY_LANGUAGE_SERVER_PATH`, `ANTIGRAVITY_LANGUAGE_SERVER_CERT_PATH` 환경변수로 override 할 수 있습니다.
 
 유용한 옵션 예시:
 
@@ -150,4 +152,5 @@ python3 export_antigravity_conversations.py --output-dir antigravity-export-2026
 | `--include-system-only` | 플래그 | 꺼짐 | user/gemini 메시지가 없는 info/warning/error 전용 conversation 도 포함합니다. |
 | `--include-subagents` | 플래그 | 꺼짐 | subagent kind conversation 도 포함합니다. |
 | `--max-tool-output-chars` | 숫자 | `4000` | 각 tool result 블록에서 유지할 최대 문자 수입니다. |
+| `--no-standalone-ls` | 플래그 | 꺼짐 | 실행 중인 앱 language server 가 없을 때 bundled standalone language server 를 자동으로 띄우지 않습니다. |
 | `--no-incremental` | 플래그 | 꺼짐 | `.antigravity-export-state.json` 을 무시하고 전체를 다시 생성합니다. |
